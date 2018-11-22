@@ -26,6 +26,8 @@ import (
 	mrpb "google.golang.org/genproto/googleapis/api/monitoredres"
 	logtypepb "google.golang.org/genproto/googleapis/logging/type"
 	logpb "google.golang.org/genproto/googleapis/logging/v2"
+
+	"k8s.io/uplog/pkg/uplog"
 )
 
 var (
@@ -80,7 +82,7 @@ func run() error {
 		return fmt.Errorf("error fetching zone: %v", err)
 	}
 
-	reportProjectID := "justinsb-cloud-kubernetes-test"
+	reportProjectID := instanceProjectID
 	logID := "uplog" // must be url encoded
 	logName := "projects/" + reportProjectID + "/logs/" + logID
 
@@ -240,8 +242,6 @@ func (r *DirectoryScanner) Run() error {
 			return nil, err
 		}
 
-		glog.Infof("reading file %s", p)
-
 		dockerParser, err := r.ctx.BuildDockerParser(name)
 		if err != nil {
 			return nil, err
@@ -255,6 +255,8 @@ func (r *DirectoryScanner) Run() error {
 	refreshDirectoryInterval := 30
 	n := 0
 
+	buffer := &uplog.ByteBuffer{}
+
 	for {
 		// We could also refresh the directory every time and use the size to avoid re-reading files
 		if (n % refreshDirectoryInterval) == 0 {
@@ -264,7 +266,8 @@ func (r *DirectoryScanner) Run() error {
 		}
 
 		for _, f := range r.readers {
-			f.Poll(r.ctx)
+			buffer.Clear()
+			f.Poll(r.ctx, buffer)
 		}
 
 		// TODO: Should we flush all our readers?
@@ -305,14 +308,10 @@ func (r *DirectoryScanner) scanForFiles(dir string, builder func(p string, fi os
 }
 
 type FileLineReader struct {
-	// TODO: DO we need bufsize, or can we use len(buffer) - or cap(buffer)
-	bufsize int
-	// TODO: Share buffer?
-	buffer []byte
-	f      *os.File
-	Out    LineSink
-	seq    string
-	pos    uint64
+	f       *os.File
+	Out     LineSink
+	seq     string
+	filePos int64
 }
 
 func (c *UplogContext) NewFileLineReader(p string) (*FileLineReader, error) {
@@ -330,19 +329,17 @@ func (c *UplogContext) NewFileLineReader(p string) (*FileLineReader, error) {
 		hasher.Write([]byte(key))
 
 		seq = stackdriverInsertIdEncoding.EncodeToString(hasher.Sum(nil))
-		glog.Infof("key %s seq %s", key, seq)
 	}
 
-	// TODO: Save marker
-	pos := uint64(0)
+	glog.Infof("tailing file %s (%s)", p, seq)
 
-	bufsize := 4
+	// TODO: Save marker
+	pos := int64(0)
+
 	r := &FileLineReader{
 		f:       f,
-		bufsize: bufsize,
-		buffer:  make([]byte, bufsize, bufsize),
 		seq:     seq,
-		pos:     pos,
+		filePos: pos,
 	}
 	return r, nil
 }
@@ -364,96 +361,42 @@ func (r *FileLineReader) Close() error {
 	return nil
 }
 
-func (r *FileLineReader) Poll(ctx *UplogContext) {
+func (r *FileLineReader) Poll(ctx *UplogContext, bb *uplog.ByteBuffer) {
 	eof := false
 
-	writePos := 0
-
-	bufsize := r.bufsize
-	buffer := r.buffer
-
 	for {
-		if writePos == bufsize {
-			// buffer is full - we can either enlarge the buffer or skip
-			// TODO: Implement skipping for super-long lines
-			newsize := bufsize * 2
-			glog.Warningf("growing buffer %d -> %d", bufsize, newsize)
-			newbuffer := make([]byte, newsize, newsize)
-			copy(newbuffer[0:bufsize], buffer[0:bufsize])
-			buffer = newbuffer
-			r.buffer = buffer
-			bufsize = newsize
-			r.bufsize = bufsize
-		}
-
-		n, err := r.f.Read(buffer[writePos:])
+		// Note: we need to offset by any available bytes, which are ones we previously read and rolled over
+		// We can't just Clear() every time either - it would be inefficient, but more importantly it would break our buffer-growing logic
+		n, err := bb.WriteFromReaderAt(r.f, r.filePos+int64(bb.Available()))
 		if err != nil {
 			if err == io.EOF {
-				if n != 0 {
-					glog.Warningf("unexpected %d bytes returned with EOF", n)
-				}
 				//glog.Infof("found eof")
 				eof = true
 			} else {
 				glog.Warningf("unexpected error reading file %s: %v", r.f.Name(), err)
 
 				// Treat like eof - exit the poll loop
-				n = 0
 				eof = true
 			}
 		}
 
-		writePos += n
-		readPos := 0
+		//glog.Infof("%s: read %d bytes", r.seq, n)
 
-		for writePos > readPos {
-			end := bytes.IndexByte(buffer[readPos:writePos], '\n')
-			if end < 0 {
+		readbuf := bb.PeekAll()
+
+		for len(readbuf) > 0 {
+			lineEnd := bytes.IndexByte(readbuf, '\n')
+			if lineEnd < 0 {
 				// No more complete lines
 				break
 			}
-			end += readPos
 
-			// We would remove \r here, except that json tolerates it
+			r.Out.GotLine(ctx, readbuf[:lineEnd], r.seq, r.filePos)
 
-			// But jsoniter doesn't tolerate empty lines
-		skipBlanks:
-			for readPos < end /* not sure we actually need the bounds-check, because \n will cause us to break */ {
-				switch buffer[readPos] {
-				case ' ', '\r', '\t':
-					readPos++
-
-				default:
-					break skipBlanks
-				}
-			}
-
-			// Skip blank lines
-			if readPos < end {
-				// TODO: Rewind file seek
-				line := buffer[readPos:end]
-
-				r.pos += uint64(end - readPos)
-
-				r.Out.GotLine(ctx, line, r.seq, r.pos)
-			} else {
-				glog.Infof("skipping blank line")
-			}
-
-			readPos = end + 1
-		}
-
-		// TODO: Just seek back in file instead?
-		// Move leftover bytes to beginning of buffer
-		{
-			n := writePos - readPos
-			//glog.Infof("leftover %d bytes", n)
-			if n > 0 {
-				copy(buffer[0:n], buffer[readPos:writePos])
-				writePos = n
-			} else {
-				writePos = 0
-			}
+			// we add 1 because we want to skip over the \n byte
+			r.filePos += int64(lineEnd + 1)
+			bb.Skip(lineEnd + 1)
+			readbuf = readbuf[lineEnd+1:]
 		}
 
 		if eof {
@@ -475,7 +418,7 @@ type Flushable interface {
 
 type LineSink interface {
 	Flushable
-	GotLine(ctx *UplogContext, line []byte, seq string, pos uint64)
+	GotLine(ctx *UplogContext, line []byte, seq string, pos int64)
 }
 
 var _ LineSink = &DockerParser{}
@@ -484,14 +427,39 @@ type UplogContext struct {
 	context.Context
 }
 
-func (s *DockerParser) GotLine(ctx *UplogContext, line []byte, seq string, pos uint64) {
-	//glog.Infof("line %q", string(line))
+func (s *DockerParser) GotLine(ctx *UplogContext, line []byte, seq string, pos int64) {
+	// jsoniter doesn't tolerate empty lines
+
+	// We would remove \r here, except that json tolerates it
+	lineStart := 0
+skipBlanks:
+	for lineStart < len(line) {
+		switch line[lineStart] {
+		case ' ', '\r', '\t':
+			lineStart++
+
+		default:
+			break skipBlanks
+		}
+	}
+
+	// Skip blank lines
+	if lineStart >= len(line) {
+		glog.Infof("skipping blank line")
+		return
+	}
+
+	if lineStart != 0 {
+		line = line[lineStart:]
+	}
+
+	//glog.Infof("line %s@%d => %q", seq, pos, string(line))
 	json := jsoniter.ConfigFastest
 
 	var dockerLogLine dockerLogLine
 	if err := json.Unmarshal(line, &dockerLogLine); err != nil {
 		// TODO: A metric instead - or at least prevent us infinite looping here
-		glog.Warningf("error parsing line: %v", err)
+		glog.Warningf("error parsing line %q %s@%d: %v", string(line), seq, pos, err)
 		return
 	}
 
@@ -530,7 +498,7 @@ func (s *DockerParser) GotLine(ctx *UplogContext, line []byte, seq string, pos u
 			logEntry.InsertId = seq + stackdriverInsertIdEncoding.EncodeToString(hasher.Sum(nil))
 		*/
 
-		logEntry.InsertId = seq + strconv.FormatUint(pos, 16)
+		logEntry.InsertId = seq + strconv.FormatInt(pos, 16)
 
 		//glog.Infof("position %d, insertId %s", pos, logEntry.InsertId)
 	}

@@ -6,6 +6,7 @@ go_library(
     importpath = "k8s.io/uplog/cmd/uplog",
     visibility = ["//visibility:private"],
     deps = [
+        "//pkg/uplog:go_default_library",
         "@com_github_coreos_go_systemd//sdjournal:go_default_library",
         "@com_github_golang_glog//:go_default_library",
         "@com_github_golang_protobuf//proto:go_default_library",
