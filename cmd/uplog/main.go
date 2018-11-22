@@ -367,7 +367,7 @@ func (r *FileLineReader) Poll(ctx *UplogContext, bb *uplog.ByteBuffer) {
 	for {
 		// Note: we need to offset by any available bytes, which are ones we previously read and rolled over
 		// We can't just Clear() every time either - it would be inefficient, but more importantly it would break our buffer-growing logic
-		n, err := bb.WriteFromReaderAt(r.f, r.filePos+int64(bb.Available()))
+		_, err := bb.WriteFromReaderAt(r.f, r.filePos+int64(bb.Available()))
 		if err != nil {
 			if err == io.EOF {
 				//glog.Infof("found eof")
