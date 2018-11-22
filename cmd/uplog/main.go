@@ -207,17 +207,80 @@ func runDockerLog() error {
 	   	    # 2016-02-17T00:04:05.931087621Z stdout F [info:2016-02-16T16:04:05.930-08:00] Some log text here
 	*/
 
-	dir := "/var/log/containers"
+	dir := ctx.NewDirectoryScanner("/var/log/containers")
+
+	return dir.Run()
+}
+
+type DirectoryScanner struct {
+	ctx     *UplogContext
+	basedir string
+	readers map[string]*FileLineReader
+}
+
+func (c *UplogContext) NewDirectoryScanner(basedir string) *DirectoryScanner {
+	d := &DirectoryScanner{
+		ctx:     c,
+		readers: make(map[string]*FileLineReader),
+		basedir: basedir,
+	}
+	return d
+}
+
+func (r *DirectoryScanner) Run() error {
+	sd, err := r.ctx.BuildStackDriverSink()
+	if err != nil {
+		return err
+	}
+
+	builder := func(p string, f os.FileInfo) (*FileLineReader, error) {
+		name := f.Name()
+		fr, err := r.ctx.NewFileLineReader(p)
+		if err != nil {
+			return nil, err
+		}
+
+		glog.Infof("reading file %s", p)
+
+		dockerParser, err := r.ctx.BuildDockerParser(name)
+		if err != nil {
+			return nil, err
+		}
+		fr.Out = dockerParser
+
+		dockerParser.Out = sd
+		return fr, nil
+	}
+
+	refreshDirectoryInterval := 30
+	n := 0
+
+	for {
+		// We could also refresh the directory every time and use the size to avoid re-reading files
+		if (n % refreshDirectoryInterval) == 0 {
+			if err := r.scanForFiles(r.basedir, builder); err != nil {
+				glog.Warningf("error scanning directory: %v", err)
+			}
+		}
+
+		for _, f := range r.readers {
+			f.Poll(r.ctx)
+		}
+
+		// TODO: Should we flush all our readers?
+		sd.Flush()
+
+		time.Sleep(time.Second)
+		n++
+	}
+
+	return nil
+}
+
+func (r *DirectoryScanner) scanForFiles(dir string, builder func(p string, fi os.FileInfo) (*FileLineReader, error)) error {
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("unable to read dir %s: %v", dir, err)
-	}
-
-	readers := make(map[string]*FileLineReader)
-
-	sd, err := ctx.BuildStackDriverSink()
-	if err != nil {
-		return err
 	}
 
 	for _, f := range files {
@@ -228,34 +291,16 @@ func runDockerLog() error {
 		}
 
 		p := filepath.Join(dir, name)
-		r, err := ctx.NewFileLineReader(p)
-		if err != nil {
-			return err
+
+		if r.readers[p] == nil {
+			fr, err := builder(p, f)
+			if err != nil {
+				glog.Warningf("error building reader for %s: %v", p, err)
+				continue
+			}
+			r.readers[p] = fr
 		}
-
-		glog.Infof("reading file %s", p)
-
-		dockerParser, err := ctx.BuildDockerParser(name)
-		if err != nil {
-			return err
-		}
-		r.Out = dockerParser
-
-		dockerParser.Out = sd
-		readers[p] = r
 	}
-
-	for {
-		for _, r := range readers {
-			r.Poll(ctx)
-		}
-
-		// TODO: Should we flush all our readers?
-		sd.Flush()
-
-		time.Sleep(time.Second)
-	}
-
 	return nil
 }
 
@@ -280,6 +325,7 @@ func (c *UplogContext) NewFileLineReader(p string) (*FileLineReader, error) {
 	{
 		hasher := fnv.New64a()
 		// TODO: Use container id?
+		// TODO: Include file create time or inode
 		key := fmt.Sprintf("%s", p)
 		hasher.Write([]byte(key))
 
@@ -486,7 +532,7 @@ func (s *DockerParser) GotLine(ctx *UplogContext, line []byte, seq string, pos u
 
 		logEntry.InsertId = seq + strconv.FormatUint(pos, 16)
 
-		glog.Infof("position %d, insertId %s", pos, logEntry.InsertId)
+		//glog.Infof("position %d, insertId %s", pos, logEntry.InsertId)
 	}
 
 	switch dockerLogLine.Stream {
