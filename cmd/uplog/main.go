@@ -16,6 +16,7 @@ import (
 	logging "cloud.google.com/go/logging/apiv2"
 	"github.com/coreos/go-systemd/sdjournal"
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
 	_struct "github.com/golang/protobuf/ptypes/struct"
 	timestamp "github.com/golang/protobuf/ptypes/timestamp"
 	jsoniter "github.com/json-iterator/go"
@@ -186,20 +187,10 @@ func run() error {
 	return nil
 }
 
-func sendMessage(ctx context.Context, client *logging.Client, req *logpb.WriteLogEntriesRequest) error {
-	// TODO: Using GRPC is likely to be the memory long pole.  If we _only_ use GRPC & HTTP2 for this,
-	// we should evaluate switching to JSON over HTTP1.1.
-	glog.Infof("sending %v", req)
-	resp, err := client.WriteLogEntries(ctx, req)
-	if err != nil {
-		return fmt.Errorf("error writing log entries: %v", err)
-	}
-	glog.V(4).Infof("response %+v", resp)
-	return nil
-}
-
 func runDockerLog() error {
-	ctx := context.TODO()
+	ctx := &UplogContext{
+		Context: context.TODO(),
+	}
 
 	/* Json Log Example:
 	       # {"log":"[info:2016-02-16T16:04:05.930-08:00] Some log text here\n","stream":"stdout","time":"2016-02-17T00:04:05.931087621Z"}
@@ -213,105 +204,100 @@ func runDockerLog() error {
 		return fmt.Errorf("unable to read dir %s: %v", dir, err)
 	}
 
-	name := ""
+	readers := make(map[string]*FileLineReader)
+
+	sd, err := ctx.BuildStackDriverSink()
+	if err != nil {
+		return err
+	}
+
 	for _, f := range files {
-		n := f.Name()
-		if strings.Contains(n, "uplog") {
+		name := f.Name()
+		// Don't be startled by our own shadow (infinite loops)
+		if strings.Contains(name, "uplog") {
 			continue
 		}
-		if !strings.Contains(n, "guestbook") {
-			continue
+
+		p := filepath.Join(dir, name)
+		r, err := ctx.NewFileLineReader(p)
+		if err != nil {
+			return err
 		}
-		glog.Infof("chose file %v", f)
-		name = n
-		break
+
+		glog.Infof("reading file %s", p)
+
+		dockerParser, err := ctx.BuildDockerParser(name)
+		if err != nil {
+			return err
+		}
+		r.Out = dockerParser
+
+		dockerParser.Out = sd
+		readers[p] = r
 	}
 
-	if name == "" {
-		glog.Infof("no file to read")
-		time.Sleep(1000 * time.Second)
+	for {
+		for _, r := range readers {
+			r.Poll(ctx)
+		}
+
+		// TODO: Should we flush all our readers?
+		sd.Flush()
+
+		time.Sleep(time.Second)
 	}
 
-	//	name := "fluentd-gcp-v3.1.0-7khbt_kube-system_fluentd-gcp-48bf1cbf9364446ffa8dffd67846116a242ad433fa02866c57fb6e3021630f6b.log"
+	return nil
+}
 
-	tokens := strings.Split(name, "_")
-	if len(tokens) != 3 {
-		return fmt.Errorf("unexpected name: %s", name)
-	}
+type FileLineReader struct {
+	// TODO: DO we need bufsize, or can we use len(buffer) - or cap(buffer)
+	bufsize int
+	// TODO: Share buffer?
+	buffer []byte
+	f      *os.File
+	Out    LineSink
+}
 
-	podName := tokens[0]
-	namespace := tokens[1]
-
-	pos := strings.LastIndex(tokens[2], "-")
-	if pos == -1 {
-		return fmt.Errorf("unexpected name (container): %s", name)
-	}
-	containerName := tokens[2][:pos]
-
-	projectID, err := metadata.ProjectID()
-	if err != nil {
-		return fmt.Errorf("error fetching project id: %v", err)
-	}
-
-	instanceID, err := metadata.InstanceID()
-	if err != nil {
-		return fmt.Errorf("error fetching instance id: %v", err)
-	}
-
-	zone, err := metadata.Zone()
-	if err != nil {
-		return fmt.Errorf("error fetching zone: %v", err)
-	}
-
-	clusterName, err := metadata.Get("instance/attributes/cluster-name")
-	if err != nil {
-		return fmt.Errorf("error fetching metadata 'instance/attributes/cluster-name': %v", err)
-	}
-
-	logID := containerName // must be url encoded
-	logName := "projects/" + projectID + "/logs/" + logID
-
-	resource := &mrpb.MonitoredResource{
-		Type: "container",
-		Labels: map[string]string{
-			"cluster_name":   clusterName,
-			"container_name": containerName,
-			"instance_id":    instanceID,
-			"namespace_id":   namespace,
-			"pod_id":         podName,
-			"project_id":     projectID,
-			"zone":           zone,
-		},
-	}
-
-	l, err := logging.NewClient(ctx)
-	if err != nil {
-		return fmt.Errorf("error building logging client: %v", err)
-	}
-
-	sink := &StackDriverSink{
-		Resource: resource,
-		LogName:  logName,
-		Client:   l,
-	}
-
-	p := filepath.Join(dir, name)
-
+func (c *UplogContext) NewFileLineReader(p string) (*FileLineReader, error) {
 	f, err := os.OpenFile(p, os.O_RDONLY, 0)
 	if err != nil {
-		return fmt.Errorf("error opening file %s: %v", p, err)
+		return nil, fmt.Errorf("error opening file %s: %v", p, err)
 	}
 
-	defer f.Close()
-
-	glog.Infof("reading file %s", p)
-
 	bufsize := 4
-	// TODO: DO we need bufsize, or can we use len(buffer) - or cap(buffer)
-	buffer := make([]byte, bufsize, bufsize)
+	r := &FileLineReader{
+		f:       f,
+		bufsize: bufsize,
+		buffer:  make([]byte, bufsize, bufsize),
+	}
+	return r, nil
+}
+
+func (r *FileLineReader) Flush() {
+	if r.Out != nil {
+		r.Out.Flush()
+	}
+}
+
+func (r *FileLineReader) Close() error {
+	if r.f != nil {
+		err := r.f.Close()
+		if err != nil {
+			return err
+		}
+		r.f = nil
+	}
+	return nil
+}
+
+func (r *FileLineReader) Poll(ctx *UplogContext) {
 	eof := false
 
 	writePos := 0
+
+	bufsize := r.bufsize
+	buffer := r.buffer
 
 	for {
 		if writePos == bufsize {
@@ -322,24 +308,29 @@ func runDockerLog() error {
 			newbuffer := make([]byte, newsize, newsize)
 			copy(newbuffer[0:bufsize], buffer[0:bufsize])
 			buffer = newbuffer
+			r.buffer = buffer
 			bufsize = newsize
+			r.bufsize = bufsize
 		}
 
-		n, err := f.Read(buffer[writePos:])
+		n, err := r.f.Read(buffer[writePos:])
 		if err != nil {
 			if err == io.EOF {
 				if n != 0 {
-					return fmt.Errorf("unexpected %d bytes returned with EOF", n)
+					glog.Warningf("unexpected %d bytes returned with EOF", n)
 				}
 				glog.Infof("found eof")
 				eof = true
 			} else {
-				return fmt.Errorf("unexpected error reading file %s: %v", p, err)
+				glog.Warningf("unexpected error reading file %s: %v", r.f.Name(), err)
+
+				// Treat like eof - exit the poll loop
+				n = 0
+				eof = true
 			}
 		}
 
 		writePos += n
-
 		readPos := 0
 
 		for writePos > readPos {
@@ -369,7 +360,7 @@ func runDockerLog() error {
 				// TODO: Rewind file seek
 				line := buffer[readPos:end]
 
-				sink.gotLine(ctx, line)
+				r.Out.GotLine(ctx, line)
 			} else {
 				glog.Infof("skipping blank line")
 			}
@@ -377,6 +368,7 @@ func runDockerLog() error {
 			readPos = end + 1
 		}
 
+		// TODO: Just seek back in file instead?
 		// Move leftover bytes to beginning of buffer
 		{
 			n := writePos - readPos
@@ -393,19 +385,31 @@ func runDockerLog() error {
 			// TODO: Complete last line when no more contents coming...
 			break
 		}
-
 	}
-
-	return nil
 }
 
-type StackDriverSink struct {
-	Client   *logging.Client
+type DockerParser struct {
 	LogName  string
 	Resource *mrpb.MonitoredResource
+	Out      RecordSink
 }
 
-func (s *StackDriverSink) gotLine(ctx context.Context, line []byte) {
+type Flushable interface {
+	Flush()
+}
+
+type LineSink interface {
+	Flushable
+	GotLine(ctx *UplogContext, line []byte)
+}
+
+var _ LineSink = &DockerParser{}
+
+type UplogContext struct {
+	context.Context
+}
+
+func (s *DockerParser) GotLine(ctx *UplogContext, line []byte) {
 	//glog.Infof("line %q", string(line))
 	json := jsoniter.ConfigFastest
 
@@ -413,9 +417,8 @@ func (s *StackDriverSink) gotLine(ctx context.Context, line []byte) {
 	if err := json.Unmarshal(line, &dockerLogLine); err != nil {
 		// TODO: A metric instead - or at least prevent us infinite looping here
 		glog.Warningf("error parsing line: %v", err)
+		return
 	}
-
-	//fmt.Printf("%+v\n", &dockerLogLine)
 
 	ts, err := time.Parse(time.RFC3339Nano, dockerLogLine.Time)
 	if err != nil {
@@ -431,7 +434,7 @@ func (s *StackDriverSink) gotLine(ctx context.Context, line []byte) {
 	}
 
 	text := dockerLogLine.Log
-	text = strings.Trim(text, "\n")
+	text = strings.TrimRight(text, "\n")
 
 	logEntry := &logpb.LogEntry{
 		LogName:  s.LogName,
@@ -450,17 +453,77 @@ func (s *StackDriverSink) gotLine(ctx context.Context, line []byte) {
 		glog.Warningf("unknown docker stream: %s", dockerLogLine.Stream)
 	}
 
-	req := &logpb.WriteLogEntriesRequest{}
+	s.Out.GotRecord(ctx, logEntry)
+	//fmt.Printf("%+v\n", &dockerLogLine)
+}
 
-	req.Entries = append(req.Entries, logEntry)
+func (s *DockerParser) Flush() {
+	if s.Out != nil {
+		s.Out.Flush()
+	}
+}
 
-	//if len(req.Entries) >= 1000 {
-	if err := sendMessage(ctx, s.Client, req); err != nil {
+type StackDriverSink struct {
+	ctx    *UplogContext
+	Client *logging.Client
+
+	request             *logpb.WriteLogEntriesRequest
+	requestSizeEstimate int
+}
+
+type RecordSink interface {
+	Flushable
+	GotRecord(ctx *UplogContext, entry *logpb.LogEntry)
+}
+
+func (s *StackDriverSink) Flush() {
+	if s.request != nil && len(s.request.Entries) > 0 {
+		s.sendMessage()
+	}
+}
+
+func (s *StackDriverSink) GotRecord(ctx *UplogContext, entry *logpb.LogEntry) {
+	if s.request == nil {
+		s.request = &logpb.WriteLogEntriesRequest{}
+	}
+
+	entry.Labels = map[string]string{
+		"from": "uplog",
+	}
+
+	entrySize := proto.Size(entry)
+	s.requestSizeEstimate += entrySize
+
+	req := s.request
+	req.Entries = append(req.Entries, entry)
+
+	flushSize := 128 * 1024
+
+	// StackDriver has a limit of 1000
+	if len(req.Entries) >= 900 || s.requestSizeEstimate >= flushSize {
+		s.sendMessage()
+	}
+}
+
+func (s *StackDriverSink) sendMessage() {
+	if err := sendMessage(s.ctx, s.Client, s.request); err != nil {
 		glog.Warningf("unable to write messages: %v", err)
 	} else {
-		req.Entries = nil
+		s.request.Entries = nil
+		s.requestSizeEstimate = 0
 	}
-	//}
+}
+
+func sendMessage(ctx context.Context, client *logging.Client, req *logpb.WriteLogEntriesRequest) error {
+	// TODO: Using GRPC is likely to be the memory long pole.  If we _only_ use GRPC & HTTP2 for this,
+	// we should evaluate switching to JSON over HTTP1.1.
+	glog.Infof("sending %d entries to stackdriver", len(req.Entries))
+	resp, err := client.WriteLogEntries(ctx, req)
+	if err != nil {
+		return fmt.Errorf("error writing log entries: %v", err)
+	}
+	glog.V(4).Infof("response %+v", resp)
+	return nil
 }
 
 func gotLine(line []byte) {
@@ -475,4 +538,77 @@ func gotLine(line []byte) {
 
 	fmt.Printf("%+v\n", &dockerLogLine)
 
+}
+
+func (c *UplogContext) BuildDockerParser(filename string) (*DockerParser, error) {
+	//	name := "fluentd-gcp-v3.1.0-7khbt_kube-system_fluentd-gcp-48bf1cbf9364446ffa8dffd67846116a242ad433fa02866c57fb6e3021630f6b.log"
+
+	tokens := strings.Split(filename, "_")
+	if len(tokens) != 3 {
+		return nil, fmt.Errorf("unexpected name: %s", filename)
+	}
+
+	podName := tokens[0]
+	namespace := tokens[1]
+
+	pos := strings.LastIndex(tokens[2], "-")
+	if pos == -1 {
+		return nil, fmt.Errorf("unexpected name (container): %s", filename)
+	}
+	containerName := tokens[2][:pos]
+
+	projectID, err := metadata.ProjectID()
+	if err != nil {
+		return nil, fmt.Errorf("error fetching project id: %v", err)
+	}
+
+	instanceID, err := metadata.InstanceID()
+	if err != nil {
+		return nil, fmt.Errorf("error fetching instance id: %v", err)
+	}
+
+	zone, err := metadata.Zone()
+	if err != nil {
+		return nil, fmt.Errorf("error fetching zone: %v", err)
+	}
+
+	clusterName, err := metadata.Get("instance/attributes/cluster-name")
+	if err != nil {
+		return nil, fmt.Errorf("error fetching metadata 'instance/attributes/cluster-name': %v", err)
+	}
+
+	logID := containerName // must be url encoded
+	logName := "projects/" + projectID + "/logs/" + logID
+
+	resource := &mrpb.MonitoredResource{
+		Type: "container",
+		Labels: map[string]string{
+			"cluster_name":   clusterName,
+			"container_name": containerName,
+			"instance_id":    instanceID,
+			"namespace_id":   namespace,
+			"pod_id":         podName,
+			"project_id":     projectID,
+			"zone":           zone,
+		},
+	}
+
+	p := &DockerParser{
+		LogName:  logName,
+		Resource: resource,
+	}
+
+	return p, nil
+}
+
+func (c *UplogContext) BuildStackDriverSink() (*StackDriverSink, error) {
+	l, err := logging.NewClient(c)
+	if err != nil {
+		return nil, fmt.Errorf("error building logging client: %v", err)
+	}
+	sink := &StackDriverSink{
+		ctx:    c,
+		Client: l,
+	}
+	return sink, nil
 }

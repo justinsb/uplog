@@ -8,6 +8,7 @@ go_library(
     deps = [
         "@com_github_coreos_go_systemd//sdjournal:go_default_library",
         "@com_github_golang_glog//:go_default_library",
+        "@com_github_golang_protobuf//proto:go_default_library",
         "@com_github_json_iterator_go//:go_default_library",
         "@com_google_cloud_go//compute/metadata:go_default_library",
         "@com_google_cloud_go//logging/apiv2:go_default_library",
