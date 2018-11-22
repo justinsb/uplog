@@ -3,6 +3,10 @@ kind: DaemonSet
 metadata:
   name: uplog
 spec:
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 100%
+    type: RollingUpdate
   selector:
     matchLabels:
       app: uplog
