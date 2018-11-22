@@ -1,0 +1,69 @@
+load("@bazel_gazelle//:def.bzl", "gazelle")
+
+# gazelle:prefix k8s.io/uplog
+gazelle(name = "gazelle")
+
+#  -----
+
+load(
+    "@io_bazel_rules_docker//container:container.bzl",
+    "container_image",
+    "container_push",
+)
+load("@package_bundle//file:packages.bzl", "packages")
+
+container_image(
+    name = "baseimage",
+    #    base = "@distroless_base//image",
+    base = "@cc_base//image",
+    debs = [
+        packages["busybox-static"],
+
+        # Needed to read journal
+        packages["libsystemd0"],
+        packages["libgcrypt20"],
+        packages["libgpg-error0"],
+        packages["liblz4-1"],
+        packages["liblzma5"],
+        packages["libselinux1"],
+        packages["libpcre3"],
+    ],
+    symlinks = {
+        "/bin/sh": "/bin/busybox",
+        "/bin/mkdir": "/bin/busybox",
+        "/bin/grep": "/bin/busybox",
+        "/bin/cat": "/bin/busybox",
+        "/bin/sed": "/bin/busybox",
+    },
+)
+
+container_image(
+    name = "uplog",
+    base = ":baseimage",
+    files = ["//cmd/uplog"],
+    entrypoint = "/uplog",
+)
+
+container_push(
+    name = "push-uplog",
+    format = "Docker",
+    image = ":uplog",
+    registry = "{STABLE_DOCKER_REGISTRY}",
+    repository = "{STABLE_DOCKER_IMAGE_PREFIX}frontend",
+    stamp = True,
+    tag = "{STABLE_DOCKER_TAG}",
+)
+
+# ------
+
+load("@io_bazel_rules_k8s//k8s:object.bzl", "k8s_object")
+
+k8s_object(
+    name = "dev",
+    template = ":manifest.yaml",
+    cluster = "{STABLE_K8S_CLUSTER}",
+    images = {
+        "k8s.gcr.io/uplog:latest": "//:uplog",
+    },
+    image_chroot = "{STABLE_DOCKER_REGISTRY}/{STABLE_DOCKER_IMAGE_PREFIX}",
+)

@@ -1,0 +1,10 @@
+# ignore bazel symlinks
+bazel-bin
+bazel-genfiles
+bazel-out
+bazel-testlogs
+bazel-uplog
+
+# ignore editor tempfiles
+*~
+
