@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base32"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +26,12 @@ import (
 	mrpb "google.golang.org/genproto/googleapis/api/monitoredres"
 	logtypepb "google.golang.org/genproto/googleapis/logging/type"
 	logpb "google.golang.org/genproto/googleapis/logging/v2"
+)
+
+var (
+	// TODO: Which characters are actually allowed?  Can we get to base64?
+	// Stackdriver allows a-z and 0-9
+	stackdriverInsertIdEncoding = base32.NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345").WithPadding(base32.NoPadding)
 )
 
 func main() {
@@ -257,6 +266,8 @@ type FileLineReader struct {
 	buffer []byte
 	f      *os.File
 	Out    LineSink
+	seq    string
+	pos    uint64
 }
 
 func (c *UplogContext) NewFileLineReader(p string) (*FileLineReader, error) {
@@ -265,11 +276,27 @@ func (c *UplogContext) NewFileLineReader(p string) (*FileLineReader, error) {
 		return nil, fmt.Errorf("error opening file %s: %v", p, err)
 	}
 
+	var seq string
+	{
+		hasher := fnv.New64a()
+		// TODO: Use container id?
+		key := fmt.Sprintf("%s", p)
+		hasher.Write([]byte(key))
+
+		seq = stackdriverInsertIdEncoding.EncodeToString(hasher.Sum(nil))
+		glog.Infof("key %s seq %s", key, seq)
+	}
+
+	// TODO: Save marker
+	pos := uint64(0)
+
 	bufsize := 4
 	r := &FileLineReader{
 		f:       f,
 		bufsize: bufsize,
 		buffer:  make([]byte, bufsize, bufsize),
+		seq:     seq,
+		pos:     pos,
 	}
 	return r, nil
 }
@@ -319,7 +346,7 @@ func (r *FileLineReader) Poll(ctx *UplogContext) {
 				if n != 0 {
 					glog.Warningf("unexpected %d bytes returned with EOF", n)
 				}
-				glog.Infof("found eof")
+				//glog.Infof("found eof")
 				eof = true
 			} else {
 				glog.Warningf("unexpected error reading file %s: %v", r.f.Name(), err)
@@ -360,7 +387,9 @@ func (r *FileLineReader) Poll(ctx *UplogContext) {
 				// TODO: Rewind file seek
 				line := buffer[readPos:end]
 
-				r.Out.GotLine(ctx, line)
+				r.pos += uint64(end - readPos)
+
+				r.Out.GotLine(ctx, line, r.seq, r.pos)
 			} else {
 				glog.Infof("skipping blank line")
 			}
@@ -400,7 +429,7 @@ type Flushable interface {
 
 type LineSink interface {
 	Flushable
-	GotLine(ctx *UplogContext, line []byte)
+	GotLine(ctx *UplogContext, line []byte, seq string, pos uint64)
 }
 
 var _ LineSink = &DockerParser{}
@@ -409,7 +438,7 @@ type UplogContext struct {
 	context.Context
 }
 
-func (s *DockerParser) GotLine(ctx *UplogContext, line []byte) {
+func (s *DockerParser) GotLine(ctx *UplogContext, line []byte, seq string, pos uint64) {
 	//glog.Infof("line %q", string(line))
 	json := jsoniter.ConfigFastest
 
@@ -442,6 +471,22 @@ func (s *DockerParser) GotLine(ctx *UplogContext, line []byte) {
 		Payload:  &logpb.LogEntry_TextPayload{TextPayload: text},
 		//Payload:   &logpb.LogEntry_JsonPayload{JsonPayload: jsonPayload},
 		Timestamp: t,
+	}
+
+	{
+		// InsertId is combined with timestamp to provide idempotency
+
+		/*
+			// TODO: Just do our own base encoding?  (we could just do hex as it is so much easier!)
+			hasher := fnv.New64a()
+			fmt.Fprintf(hasher, "%d", pos)
+
+			logEntry.InsertId = seq + stackdriverInsertIdEncoding.EncodeToString(hasher.Sum(nil))
+		*/
+
+		logEntry.InsertId = seq + strconv.FormatUint(pos, 16)
+
+		glog.Infof("position %d, insertId %s", pos, logEntry.InsertId)
 	}
 
 	switch dockerLogLine.Stream {
